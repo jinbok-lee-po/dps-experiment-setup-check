@@ -41,6 +41,19 @@
     return [...new Set(ids)].sort((a, b) => a - b);
   }
 
+  /** Zones 가 비었을 때 본문에 흔한 오류·미존재 안내가 있는지 (보조 판별) */
+  function findLikelyExperimentLoadError(bodyText) {
+    const t = bodyText || "";
+    const lower = t.toLowerCase();
+    if (/\b404\b/.test(t) || lower.includes("not found") || lower.includes("could not find")) {
+      return "화면에 오류·미존재 안내가 감지됨 (404/not found 등)";
+    }
+    if (/존재하지\s*않|찾을\s*수\s*없|페이지(를)?\s*찾을\s*수\s*없/.test(t)) {
+      return "화면에 실험·페이지 미존재 안내가 감지됨";
+    }
+    return null;
+  }
+
   function extractZonesFromIframe() {
     const f = document.querySelector("iframe.pluginIframe");
     if (!f) return { ok: false, error: "no iframe.pluginIframe" };
@@ -67,6 +80,11 @@
       .map((s) => s.trim())
       .filter(Boolean)
       .filter((s) => s !== "Zones");
+    if (lines.length === 0) {
+      const hint = findLikelyExperimentLoadError(t);
+      const base = "실험을 불러오지 못했거나 존재하지 않는 실험일 수 있습니다 (Zones 목록이 비어 있음)";
+      return { ok: false, error: hint ? `${hint} / ${base}` : base };
+    }
     return { ok: true, zones: lines };
   }
 
@@ -145,13 +163,19 @@
       if (r.error || !r.zones) continue;
       for (const z of r.zones) collected.add(normalizeZoneLabel(z));
     }
+    const refNameSet = new Set(ref.zones.map(({ name }) => normalizeZoneLabel(name)));
     const missing = ref.zones.filter(({ name }) => !collected.has(normalizeZoneLabel(name)));
+    const matchedRefCount = ref.zones.length - missing.length;
+    const orphans = [...collected].filter((c) => !refNameSet.has(c)).sort((a, b) => a.localeCompare(b));
     return {
       totalRef: ref.zones.length,
       updated: ref.updated,
       unionDistinctCount: collected.size,
+      matchedRefCount,
       missing,
       missingCount: missing.length,
+      orphans,
+      orphanCount: orphans.length,
     };
   }
 
@@ -239,7 +263,12 @@
     if (coverage) {
       lines.push("");
       lines.push("=== 2. 기준 지역(RGN2) 커버리지 ===");
-      lines.push(`중복 제거한 전체 실험대상 시군구zone의 합: ${coverage.unionDistinctCount}`);
+      lines.push(`실험에서 수집된 실험 시군구zone 수: ${coverage.unionDistinctCount}`);
+      lines.push(`OD 오픈지역 내 실험 시군구Zone 수: ${coverage.matchedRefCount}`);
+      if (coverage.orphanCount > 0) {
+        lines.push("기준 목록에 없는 수집 문자열:");
+        for (const o of coverage.orphans) lines.push(o);
+      }
       lines.push(`기준 일자: ${coverage.updated}`);
       lines.push(`전체 OD 오픈지역 수: ${coverage.totalRef}`);
       lines.push(`기준 대비 누락: ${coverage.missingCount}개`);
@@ -279,6 +308,9 @@
                     updated: coverage.updated,
                     totalRef: coverage.totalRef,
                     unionDistinctCount: coverage.unionDistinctCount,
+                    matchedRefCount: coverage.matchedRefCount,
+                    orphanCount: coverage.orphanCount,
+                    orphans: coverage.orphans,
                     missingCount: coverage.missingCount,
                     missing: coverage.missing,
                   },
