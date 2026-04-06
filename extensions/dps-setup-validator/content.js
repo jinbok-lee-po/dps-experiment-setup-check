@@ -8,6 +8,8 @@
   const ORIGIN = "https://portal.woowahan.com";
   /** 실행창·FAB 노출: 목록 또는 그 하위(…/id/edit, …/clone 등) (쿼리 제외, 끝 슬래시 정규화) */
   const INCENTIVES_HASH_PREFIX = "#/experiments/incentives";
+  /** Select Target Customers → Parent Verticals 기대값 (대소문자 무시) */
+  const EXPECTED_PARENT_VERTICAL = "restaurant";
 
   function normalizedHash() {
     const raw = (window.location.hash || "").split("?")[0];
@@ -54,6 +56,27 @@
     return null;
   }
 
+  /** Parent Verticals 라벨 직후 본문에서 값 줄만 수집 (빈 줄 전까지, 상한 30줄) */
+  function parseParentVerticalValues(afterLabel) {
+    const rows = (afterLabel || "").split("\n");
+    const out = [];
+    for (const row of rows) {
+      const s = row.trim();
+      if (s === "") {
+        if (out.length > 0) break;
+        continue;
+      }
+      if (/^(select target customers|zones)\b/i.test(s)) break;
+      out.push(s);
+      if (out.length >= 30) break;
+    }
+    return out;
+  }
+
+  function parentVerticalsIncludeExpected(vals, expectedLower) {
+    return vals.some((v) => String(v).trim().toLowerCase() === expectedLower);
+  }
+
   function extractZonesFromIframe() {
     const f = document.querySelector("iframe.pluginIframe");
     if (!f) return { ok: false, error: "no iframe.pluginIframe" };
@@ -73,8 +96,9 @@
     const z = slice.indexOf(zonesLabel);
     if (z === -1) return { ok: false, error: "Zones section not found in iframe text" };
     const after = slice.slice(z + zonesLabel.length);
-    const end = after.search(/\nParent Verticals\b/);
-    const block = end === -1 ? after : after.slice(0, end);
+    const end = after.search(/\nParent Verticals\b/i);
+    if (end === -1) return { ok: false, error: "Parent Verticals section not found in iframe text" };
+    const block = after.slice(0, end);
     const lines = block
       .split("\n")
       .map((s) => s.trim())
@@ -85,7 +109,12 @@
       const base = "실험을 불러오지 못했거나 존재하지 않는 실험일 수 있습니다 (Zones 목록이 비어 있음)";
       return { ok: false, error: hint ? `${hint} / ${base}` : base };
     }
-    return { ok: true, zones: lines };
+    const afterPv = after.slice(end).replace(/^\s*\n*Parent Verticals\b\s*/i, "");
+    const parentVerticals = parseParentVerticalValues(afterPv);
+    if (parentVerticals.length === 0) {
+      return { ok: false, error: "Parent Verticals 값이 비어 있음" };
+    }
+    return { ok: true, zones: lines, parentVerticals };
   }
 
   /** iframe 이 실제로 해당 실험 edit URL 로 로드됐는지 — 이전 실험의 Zones 텍스트를 읽지 않도록 함 */
@@ -200,11 +229,23 @@
         continue;
       }
       const data = extractZonesFromIframe();
-      if (data.ok) return data.zones;
+      if (data.ok) return { zones: data.zones, parentVerticals: data.parentVerticals };
       lastErr = data.error || lastErr;
       await sleep(POLL_MS);
     }
     throw new Error(lastErr);
+  }
+
+  function findParentVerticalMismatches(results, expectedLower) {
+    const mismatches = [];
+    for (const r of results) {
+      if (r.error) continue;
+      const pv = r.parentVerticals || [];
+      if (!parentVerticalsIncludeExpected(pv, expectedLower)) {
+        mismatches.push({ experimentId: r.experimentId, parentVerticals: pv });
+      }
+    }
+    return mismatches;
   }
 
   function findDuplicateZones(results) {
@@ -235,6 +276,8 @@
     const allNames = new Set();
     for (const r of ok) for (const z of r.zones) allNames.add(z);
     const dupes = findDuplicateZones(results);
+    const expectedPvLower = EXPECTED_PARENT_VERTICAL.toLowerCase();
+    const pvMismatches = findParentVerticalMismatches(results, expectedPvLower);
     let coverage = null;
     if (ref && Array.isArray(ref.zones)) {
       coverage = computeRgn2Coverage(results, ref);
@@ -260,9 +303,24 @@
       lines.push(`--- 중복으로 잡힌 서로 다른 zone 이름 수: ${dupes.length}`);
     }
 
+    lines.push("");
+    lines.push("=== 2. Parent Verticals (restaurant) ===");
+    lines.push(
+      `Select Target Customers의 Parent Verticals에 "${EXPECTED_PARENT_VERTICAL}"(대소문자 무시)가 포함되어야 합니다. 아래 실험은 화면에서 읽은 값 기준으로 조건을 만족하지 않습니다.`
+    );
+    if (pvMismatches.length === 0) {
+      lines.push("(없음 · 수집 성공한 실험 모두 조건 충족)");
+    } else {
+      for (const { experimentId, parentVerticals } of pvMismatches) {
+        const shown = parentVerticals.length ? parentVerticals.join(", ") : "(비어 있음)";
+        lines.push(`${experimentId}\t실제: ${shown}`);
+      }
+      lines.push(`--- 조건 불만족 실험 수: ${pvMismatches.length}`);
+    }
+
     if (coverage) {
       lines.push("");
-      lines.push("=== 2. 기준 지역(RGN2) 커버리지 ===");
+      lines.push("=== 3. 기준 지역(RGN2) 커버리지 ===");
       lines.push(`실험에서 수집된 실험 시군구zone 수: ${coverage.unionDistinctCount}`);
       lines.push(`OD 오픈지역 내 실험 시군구Zone 수: ${coverage.matchedRefCount}`);
       if (coverage.orphanCount > 0) {
@@ -281,7 +339,7 @@
     }
 
     lines.push("");
-    lines.push("=== 3. 실험별 zone 개수 ===");
+    lines.push("=== 4. 실험별 zone 개수 ===");
     for (const r of results) {
       if (r.error) {
         lines.push(`${r.experimentId}\t(실패: ${r.error})`);
@@ -302,6 +360,8 @@
             sumCounts,
             uniqueZoneNames: allNames.size,
             duplicateZoneEntries: dupes,
+            expectedParentVertical: EXPECTED_PARENT_VERTICAL,
+            parentVerticalMismatches: pvMismatches,
             ...(coverage
               ? {
                   coverage: {
@@ -326,12 +386,12 @@
   }
 
   async function runBatch(ids) {
-    /** @type {{ experimentId: number, zones?: string[], error?: string }[]} */
+    /** @type {{ experimentId: number, zones?: string[], parentVerticals?: string[], error?: string }[]} */
     const batchResults = [];
     for (const experimentId of ids) {
       try {
-        const zones = await fetchZonesForExperiment(experimentId);
-        batchResults.push({ experimentId, zones });
+        const { zones, parentVerticals } = await fetchZonesForExperiment(experimentId);
+        batchResults.push({ experimentId, zones, parentVerticals });
       } catch (e) {
         batchResults.push({ experimentId, error: String(e.message || e) });
       }
@@ -375,6 +435,7 @@
             <li>각 실험에 설정된 <strong>zone 이름 목록</strong></li>
             <li>전체 실험에 대한 zone 개수 합계·고유 이름 수·<strong>실험 간 중복 zone</strong> 여부</li>
             <li>기준 RGN2 목록 대비 <strong>누락 지역(RGN2_CD·시군구명)</strong></li>
+            <li>Select Target Customers의 <strong>Parent Verticals</strong>에 <strong>restaurant</strong> 포함 여부</li>
           </ul>
         </div>
         <div class="dps-actions">

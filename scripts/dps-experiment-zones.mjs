@@ -27,6 +27,8 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, "..");
 const ZONE_REFERENCE_PATH = join(PROJECT_ROOT, "extensions/dps-setup-validator/reference-zones.json");
+/** Select Target Customers → Parent Verticals 기대값 (대소문자 무시) */
+const EXPECTED_PARENT_VERTICAL = "restaurant";
 
 function loadZoneReference() {
   if (!existsSync(ZONE_REFERENCE_PATH)) {
@@ -39,6 +41,23 @@ function normalizeZoneLabel(s) {
   return String(s || "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function parentVerticalsIncludeExpected(vals, expectedLower) {
+  return vals.some((v) => String(v).trim().toLowerCase() === expectedLower);
+}
+
+function findParentVerticalMismatches(results, expectedLower) {
+  /** @type {{ experimentId: number, parentVerticals: string[] }[]} */
+  const mismatches = [];
+  for (const r of results) {
+    if (r.error) continue;
+    const pv = r.parentVerticals || [];
+    if (!parentVerticalsIncludeExpected(pv, expectedLower)) {
+      mismatches.push({ experimentId: r.experimentId, parentVerticals: pv });
+    }
+  }
+  return mismatches;
 }
 
 function computeRgn2Coverage(results, ref) {
@@ -186,8 +205,9 @@ function extractZonesJsForExperiment(expectedId) {
     const z = slice.indexOf(zonesLabel);
     if (z === -1) return JSON.stringify({ ok: false, error: "Zones section not found in iframe text" });
     const after = slice.slice(z + zonesLabel.length);
-    const end = after.search(/\\nParent Verticals\\b/);
-    const block = end === -1 ? after : after.slice(0, end);
+    const end = after.search(/\\nParent Verticals\\b/i);
+    if (end === -1) return JSON.stringify({ ok: false, error: "Parent Verticals section not found in iframe text" });
+    const block = after.slice(0, end);
     const lines = block
       .split("\\n")
       .map((s) => s.trim())
@@ -209,7 +229,23 @@ function extractZonesJsForExperiment(expectedId) {
       const base = "실험을 불러오지 못했거나 존재하지 않는 실험일 수 있습니다 (Zones 목록이 비어 있음)";
       return JSON.stringify({ ok: false, error: hint ? hint + " / " + base : base });
     }
-    return JSON.stringify({ ok: true, zones: lines });
+    const afterPv = after.slice(end).replace(/^\\s*\\n*Parent Verticals\\b\\s*/i, "");
+    const pvRows = afterPv.split("\\n");
+    const parentVerticals = [];
+    for (let i = 0; i < pvRows.length; i++) {
+      const s = pvRows[i].trim();
+      if (s === "") {
+        if (parentVerticals.length > 0) break;
+        continue;
+      }
+      if (/^(select target customers|zones)\\b/i.test(s)) break;
+      parentVerticals.push(s);
+      if (parentVerticals.length >= 30) break;
+    }
+    if (parentVerticals.length === 0) {
+      return JSON.stringify({ ok: false, error: "Parent Verticals 값이 비어 있음" });
+    }
+    return JSON.stringify({ ok: true, zones: lines, parentVerticals: parentVerticals });
   })()`;
 }
 
@@ -239,7 +275,7 @@ function parseIframeNavResult(evalOut) {
   if (!data.ok) throw new Error(data.error || "iframe navigation failed");
 }
 
-function parseEvalZonesJson(evalOut) {
+function parseEvalTargetCustomersJson(evalOut) {
   const line = evalOut.trim().split("\n").pop() || evalOut.trim();
   let data;
   try {
@@ -248,7 +284,7 @@ function parseEvalZonesJson(evalOut) {
     throw new Error(`eval 결과 JSON 파싱 실패:\n${evalOut}`);
   }
   if (!data.ok) throw new Error(data.error || "unknown error");
-  return data.zones;
+  return { zones: data.zones, parentVerticals: data.parentVerticals };
 }
 
 function sleepSync(ms) {
@@ -274,7 +310,7 @@ function fetchZonesForExperiment(cdpRoot, targetPrefix, experimentId) {
   while (Date.now() < deadline) {
     try {
       const evalOut = runCdp(cdpRoot, ["eval", targetPrefix, extractZonesJsForExperiment(id)]);
-      return parseEvalZonesJson(evalOut);
+      return parseEvalTargetCustomersJson(evalOut);
     } catch (e) {
       lastErr = e.message || String(e);
       sleepSync(pollMs);
@@ -335,6 +371,8 @@ function printBatchReport(results, ref) {
   const allNames = new Set();
   for (const r of ok) for (const z of r.zones) allNames.add(z);
   const dupes = findDuplicateZones(results);
+  const expectedPvLower = EXPECTED_PARENT_VERTICAL.toLowerCase();
+  const pvMismatches = findParentVerticalMismatches(results, expectedPvLower);
   let coverage = null;
   if (ref && Array.isArray(ref.zones)) {
     coverage = computeRgn2Coverage(results, ref);
@@ -359,9 +397,24 @@ function printBatchReport(results, ref) {
     console.log(`--- 중복으로 잡힌 서로 다른 zone 이름 수: ${dupes.length}`);
   }
 
+  console.log("");
+  console.log("=== 2. Parent Verticals (restaurant) ===");
+  console.log(
+    `Select Target Customers의 Parent Verticals에 "${EXPECTED_PARENT_VERTICAL}"(대소문자 무시)가 포함되어야 합니다. 아래 실험은 화면에서 읽은 값 기준으로 조건을 만족하지 않습니다.`
+  );
+  if (pvMismatches.length === 0) {
+    console.log("(없음 · 수집 성공한 실험 모두 조건 충족)");
+  } else {
+    for (const { experimentId, parentVerticals } of pvMismatches) {
+      const shown = parentVerticals.length ? parentVerticals.join(", ") : "(비어 있음)";
+      console.log(`${experimentId}\t실제: ${shown}`);
+    }
+    console.log(`--- 조건 불만족 실험 수: ${pvMismatches.length}`);
+  }
+
   if (coverage) {
     console.log("");
-    console.log("=== 2. 기준 지역(RGN2) 커버리지 ===");
+    console.log("=== 3. 기준 지역(RGN2) 커버리지 ===");
     console.log(`실험에서 수집된 실험 시군구zone 수: ${coverage.unionDistinctCount}`);
     console.log(`OD 오픈지역 내 실험 시군구Zone 수: ${coverage.matchedRefCount}`);
     if (coverage.orphanCount > 0) {
@@ -380,7 +433,7 @@ function printBatchReport(results, ref) {
   }
 
   console.log("");
-  console.log("=== 3. 실험별 zone 개수 ===");
+  console.log("=== 4. 실험별 zone 개수 ===");
   for (const r of results) {
     if (r.error) {
       console.log(`${r.experimentId}\t(실패: ${r.error})`);
@@ -401,6 +454,8 @@ function printBatchReport(results, ref) {
           sumCounts,
           uniqueZoneNames: allNames.size,
           duplicateZoneEntries: dupes,
+          expectedParentVertical: EXPECTED_PARENT_VERTICAL,
+          parentVerticalMismatches: pvMismatches,
           ...(coverage
             ? {
                 coverage: {
@@ -453,13 +508,17 @@ function main() {
   if (parsed.mode === "single") {
     const { experimentId } = parsed;
     try {
-      const zones = fetchZonesForExperiment(cdpRoot, targetPrefix, experimentId);
+      const { zones, parentVerticals } = fetchZonesForExperiment(cdpRoot, targetPrefix, experimentId);
       const coverage = computeRgn2Coverage([{ experimentId: Number(experimentId), zones }], ref);
+      const expectedPvLower = EXPECTED_PARENT_VERTICAL.toLowerCase();
+      const parentVerticalOk = parentVerticalsIncludeExpected(parentVerticals, expectedPvLower);
       console.log(
         JSON.stringify(
           {
             experimentId,
             zones,
+            parentVerticals,
+            parentVerticalOk,
             coverage: {
               updated: coverage.updated,
               totalRef: coverage.totalRef,
@@ -482,12 +541,12 @@ function main() {
     return;
   }
 
-  /** @type {{ experimentId: number, zones?: string[], error?: string }[]} */
+  /** @type {{ experimentId: number, zones?: string[], parentVerticals?: string[], error?: string }[]} */
   const batchResults = [];
   for (const experimentId of parsed.batchIds) {
     try {
-      const zones = fetchZonesForExperiment(cdpRoot, targetPrefix, String(experimentId));
-      batchResults.push({ experimentId, zones });
+      const { zones, parentVerticals } = fetchZonesForExperiment(cdpRoot, targetPrefix, String(experimentId));
+      batchResults.push({ experimentId, zones, parentVerticals });
     } catch (e) {
       const msg = String(e.message || e);
       console.error(`[실험 ${experimentId}] ${msg}`);
