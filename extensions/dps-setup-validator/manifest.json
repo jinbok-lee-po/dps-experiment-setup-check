@@ -1,14 +1,20 @@
 {
   "manifest_version": 3,
-  "name": "DPS 설정 검증",
-  "version": "1.0.4",
-  "description": "Woowa Portal DPS 실험의 Target Zones 목록을 검증합니다.",
+  "name": "DPS 인센티브 실험 설정 검증",
+  "version": "1.1.1",
+  "description": "Woowa Portal DPS 인센티브 실험의 Target Zones 목록을 검증합니다.",
   "content_scripts": [
     {
       "matches": ["https://portal.woowahan.com/*"],
       "js": ["content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["reference-zones.json"],
+      "matches": ["https://portal.woowahan.com/*"]
     }
   ]
 }

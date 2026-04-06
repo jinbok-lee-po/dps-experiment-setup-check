@@ -19,13 +19,43 @@
  */
 
 import { spawnSync } from "child_process";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, "..");
+const ZONE_REFERENCE_PATH = join(PROJECT_ROOT, "extensions/dps-setup-validator/reference-zones.json");
+
+function loadZoneReference() {
+  if (!existsSync(ZONE_REFERENCE_PATH)) {
+    throw new Error(`기준 목록 없음: ${ZONE_REFERENCE_PATH}`);
+  }
+  return JSON.parse(readFileSync(ZONE_REFERENCE_PATH, "utf8"));
+}
+
+function normalizeZoneLabel(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function computeRgn2Coverage(results, ref) {
+  const collected = new Set();
+  for (const r of results) {
+    if (r.error || !r.zones) continue;
+    for (const z of r.zones) collected.add(normalizeZoneLabel(z));
+  }
+  const missing = ref.zones.filter(({ name }) => !collected.has(normalizeZoneLabel(name)));
+  return {
+    totalRef: ref.zones.length,
+    updated: ref.updated,
+    unionDistinctCount: collected.size,
+    missing,
+    missingCount: missing.length,
+  };
+}
 
 function resolveCdpRoot() {
   const env = process.env.CHROME_CDP_SKILL?.trim();
@@ -272,36 +302,32 @@ function findDuplicateZones(results) {
   return dupes;
 }
 
-function printBatchReport(results) {
+function printBatchReport(results, ref) {
   const ok = results.filter((r) => !r.error);
   const fail = results.filter((r) => r.error);
 
-  console.log("=== 실험별 zone 개수 ===");
   let sumCounts = 0;
   for (const r of results) {
-    if (r.error) {
-      console.log(`${r.experimentId}\t(실패: ${r.error})`);
-    } else {
-      const n = r.zones.length;
-      sumCounts += n;
-      const uniq = new Set(r.zones).size;
-      const intraDup = n > uniq ? `\t(동일 실험 내 중복 이름 ${n - uniq}건)` : "";
-      console.log(`${r.experimentId}\t${n}${intraDup}`);
-    }
+    if (!r.error) sumCounts += r.zones.length;
   }
-  console.log(`---`);
-  console.log(`실험 수(시도): ${results.length}`);
-  console.log(`성공 실험 수: ${ok.length}`);
-  console.log(`실패 실험 수: ${fail.length}`);
-  console.log(`zone 개수 합계(성공한 실험만, 행 단위 합): ${sumCounts}`);
-
   const allNames = new Set();
   for (const r of ok) for (const z of r.zones) allNames.add(z);
-  console.log(`고유 zone 이름 수(전체 실험 통합): ${allNames.size}`);
-
   const dupes = findDuplicateZones(results);
+  let coverage = null;
+  if (ref && Array.isArray(ref.zones)) {
+    coverage = computeRgn2Coverage(results, ref);
+  }
+
+  console.log("=== 0. 개요 ===");
+  console.log(`시도 ${results.length}건 (성공 ${ok.length} · 실패 ${fail.length})`);
+  console.log(
+    `실험에 셋팅된 시군구zone의 총 합계: ${sumCounts} · 중복 제거한 전체 실험대상 시군구zone의 합: ${allNames.size}`
+  );
   console.log("");
-  console.log("=== 중복 zone (2개 이상 실험에 동일 이름) ===");
+  console.log("=== 1. 중복 zone (2개 이상 실험에 동일 이름) ===");
+  console.log(
+    "DPS는 동일 지역(zone)에 대해 하나의 인센티브 실험만 둘 수 있습니다. 아래에 항목이 있으면 크롬 익스텐션을 재실행하시고, 크롬 익스텐션 오류를 제보해주세요."
+  );
   if (dupes.length === 0) {
     console.log("(없음)");
   } else {
@@ -311,8 +337,60 @@ function printBatchReport(results) {
     console.log(`--- 중복으로 잡힌 서로 다른 zone 이름 수: ${dupes.length}`);
   }
 
+  if (coverage) {
+    console.log("");
+    console.log("=== 2. 기준 지역(RGN2) 커버리지 ===");
+    console.log(`중복 제거한 전체 실험대상 시군구zone의 합: ${coverage.unionDistinctCount}`);
+    console.log(`기준 일자: ${coverage.updated}`);
+    console.log(`전체 OD 오픈지역 수: ${coverage.totalRef}`);
+    console.log(`기준 대비 누락: ${coverage.missingCount}개`);
+    if (coverage.missingCount > 0) {
+      console.log("누락 목록 (RGN2_CD\t시군구명):");
+      for (const m of coverage.missing) console.log(`${m.rgn2_cd}\t${m.name}`);
+    } else {
+      console.log("(누락 없음)");
+    }
+  }
+
   console.log("");
-  console.log(JSON.stringify({ results, summary: { sumCounts, uniqueZoneNames: allNames.size, duplicateZoneEntries: dupes } }, null, 2));
+  console.log("=== 3. 실험별 zone 개수 ===");
+  for (const r of results) {
+    if (r.error) {
+      console.log(`${r.experimentId}\t(실패: ${r.error})`);
+    } else {
+      const n = r.zones.length;
+      const uniq = new Set(r.zones).size;
+      const intraDup = n > uniq ? `\t(동일 실험 내 중복 이름 ${n - uniq}건)` : "";
+      console.log(`${r.experimentId}\t${n}${intraDup}`);
+    }
+  }
+
+  console.log("");
+  console.log(
+    JSON.stringify(
+      {
+        results,
+        summary: {
+          sumCounts,
+          uniqueZoneNames: allNames.size,
+          duplicateZoneEntries: dupes,
+          ...(coverage
+            ? {
+                coverage: {
+                  updated: coverage.updated,
+                  totalRef: coverage.totalRef,
+                  unionDistinctCount: coverage.unionDistinctCount,
+                  missingCount: coverage.missingCount,
+                  missing: coverage.missing,
+                },
+              }
+            : {}),
+        },
+      },
+      null,
+      2
+    )
+  );
 }
 
 function main() {
@@ -334,11 +412,36 @@ function main() {
 
   const targetPrefix = resolveTargetPrefix(cdpRoot, parsed.targetPrefix);
 
+  let ref;
+  try {
+    ref = loadZoneReference();
+  } catch (e) {
+    console.error("기준 zone 목록:", e.message || e);
+    process.exit(1);
+  }
+
   if (parsed.mode === "single") {
     const { experimentId } = parsed;
     try {
       const zones = fetchZonesForExperiment(cdpRoot, targetPrefix, experimentId);
-      console.log(JSON.stringify({ experimentId, zones }, null, 2));
+      const coverage = computeRgn2Coverage([{ experimentId: Number(experimentId), zones }], ref);
+      console.log(
+        JSON.stringify(
+          {
+            experimentId,
+            zones,
+            coverage: {
+              updated: coverage.updated,
+              totalRef: coverage.totalRef,
+              unionDistinctCount: coverage.unionDistinctCount,
+              missingCount: coverage.missingCount,
+              missing: coverage.missing,
+            },
+          },
+          null,
+          2
+        )
+      );
     } catch (e) {
       console.error(e.message || e);
       process.exit(1);
@@ -358,7 +461,7 @@ function main() {
       batchResults.push({ experimentId, error: msg });
     }
   }
-  printBatchReport(batchResults);
+  printBatchReport(batchResults, ref);
 }
 
 main();
