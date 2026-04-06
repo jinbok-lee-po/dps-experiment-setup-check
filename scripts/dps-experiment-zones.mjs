@@ -10,10 +10,12 @@
  *
  * 사용:
  *   node scripts/dps-experiment-zones.mjs [실험ID] [--target 타겟ID접두사]
+ *   node scripts/dps-experiment-zones.mjs --batch 149-152,154-158 [--target ...]
  *
  * 예:
  *   node scripts/dps-experiment-zones.mjs 158
  *   node scripts/dps-experiment-zones.mjs 158 --target AFDD0C34
+ *   node scripts/dps-experiment-zones.mjs --batch 149-152,154-158
  */
 
 import { spawnSync } from "child_process";
@@ -49,9 +51,31 @@ function runCdp(cdpRoot, args) {
   return r.stdout;
 }
 
+/** "149-152,154,156-158" → 정렬·중복 제거된 ID 배열 */
+function parseBatchSpec(spec) {
+  const ids = [];
+  for (const raw of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
+    if (raw.includes("-")) {
+      const [a, b] = raw.split("-").map((x) => x.trim());
+      const start = Number(a);
+      const end = Number(b);
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start > end) {
+        throw new Error(`잘못된 구간: ${raw}`);
+      }
+      for (let n = start; n <= end; n++) ids.push(n);
+    } else {
+      const n = Number(raw);
+      if (!Number.isInteger(n)) throw new Error(`잘못된 실험 ID: ${raw}`);
+      ids.push(n);
+    }
+  }
+  return [...new Set(ids)].sort((x, y) => x - y);
+}
+
 function parseArgs(argv) {
   let experimentId = "158";
   let targetPrefix = null;
+  let batchSpec = null;
   const rest = argv.slice(2);
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === "--target") {
@@ -59,13 +83,23 @@ function parseArgs(argv) {
       if (!targetPrefix) throw new Error("--target 뒤에 타겟 ID 접두사가 필요합니다.");
       continue;
     }
+    if (rest[i] === "--batch") {
+      batchSpec = rest[++i];
+      if (!batchSpec) throw new Error("--batch 뒤에 구간/목록이 필요합니다. 예: 149-152,154-158");
+      continue;
+    }
     if (rest[i].startsWith("-")) throw new Error(`알 수 없는 옵션: ${rest[i]}`);
     experimentId = rest[i];
+  }
+  if (batchSpec) {
+    const batchIds = parseBatchSpec(batchSpec);
+    if (batchIds.length === 0) throw new Error("--batch 결과가 비었습니다.");
+    return { mode: "batch", batchIds, targetPrefix };
   }
   if (!/^\d+$/.test(experimentId)) {
     throw new Error(`실험 ID는 숫자여야 합니다: ${experimentId}`);
   }
-  return { experimentId, targetPrefix };
+  return { mode: "single", experimentId, targetPrefix };
 }
 
 function findPortalTargetPrefix(listStdout) {
@@ -109,6 +143,158 @@ const EXTRACT_ZONES_JS = `(() => {
   return JSON.stringify({ ok: true, zones: lines });
 })()`;
 
+/**
+ * 상위 창만 nav 하면 plugin iframe 의 해시가 안 바뀌어 목록 화면에 머무는 경우가 있다.
+ * iframe.contentWindow.location 을 실험 edit URL 로 맞춘다.
+ */
+function navPluginIframeToEditJs(experimentId) {
+  const hash = `#/experiments/incentives/${experimentId}/edit`;
+  return `(() => {
+    const base = "https://portal.woowahan.com/pv2/kr/p/logistics-dynamic-pricing";
+    const hash = ${JSON.stringify(hash)};
+    const f = document.querySelector("iframe.pluginIframe");
+    if (!f || !f.contentWindow) return JSON.stringify({ ok: false, error: "no iframe.pluginIframe" });
+    try {
+      f.contentWindow.location.replace(base + hash);
+      return JSON.stringify({ ok: true });
+    } catch (e) {
+      return JSON.stringify({ ok: false, error: "iframe nav: " + e });
+    }
+  })()`;
+}
+
+function parseIframeNavResult(evalOut) {
+  const line = evalOut.trim().split("\n").pop() || evalOut.trim();
+  const data = JSON.parse(line);
+  if (!data.ok) throw new Error(data.error || "iframe navigation failed");
+}
+
+function parseEvalZonesJson(evalOut) {
+  const line = evalOut.trim().split("\n").pop() || evalOut.trim();
+  let data;
+  try {
+    data = JSON.parse(line);
+  } catch {
+    throw new Error(`eval 결과 JSON 파싱 실패:\n${evalOut}`);
+  }
+  if (!data.ok) throw new Error(data.error || "unknown error");
+  return data.zones;
+}
+
+function sleepSync(ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {}
+}
+
+/**
+ * iframe 라우트 반영·렌더 지연이 있으면 Zones 블록이 잠깐 비어 있다.
+ * DPS_ZONES_POLL_MS (기본 500), DPS_ZONES_MAX_MS (기본 25000) 로 조절 가능.
+ */
+function fetchZonesForExperiment(cdpRoot, targetPrefix, experimentId) {
+  const id = String(experimentId);
+  const url = `https://portal.woowahan.com/pv2/kr/p/logistics-dynamic-pricing#/experiments/incentives/${id}/edit`;
+  runCdp(cdpRoot, ["nav", targetPrefix, url]);
+  parseIframeNavResult(runCdp(cdpRoot, ["eval", targetPrefix, navPluginIframeToEditJs(id)]));
+  const pollMs = Number(process.env.DPS_ZONES_POLL_MS) || 500;
+  const maxMs = Number(process.env.DPS_ZONES_MAX_MS) || 25000;
+  const deadline = Date.now() + maxMs;
+  let lastErr = "timeout waiting for Zones section";
+  while (Date.now() < deadline) {
+    try {
+      const evalOut = runCdp(cdpRoot, ["eval", targetPrefix, EXTRACT_ZONES_JS]);
+      return parseEvalZonesJson(evalOut);
+    } catch (e) {
+      lastErr = e.message || String(e);
+      sleepSync(pollMs);
+    }
+  }
+  throw new Error(lastErr);
+}
+
+function resolveTargetPrefix(cdpRoot, targetPrefix) {
+  if (targetPrefix) return targetPrefix;
+  let listOut;
+  try {
+    listOut = runCdp(cdpRoot, ["list"]);
+  } catch (e) {
+    console.error("cdp list 실패:", e.message);
+    process.exit(1);
+  }
+  const found = findPortalTargetPrefix(listOut);
+  if (!found) {
+    console.error(
+      "logistics-dynamic-pricing 탭을 list에서 찾지 못했습니다. 포털 탭을 연 뒤 다시 시도하거나 --target 으로 타겟 접두사를 지정하세요.\n\n--- list ---\n" +
+        listOut
+    );
+    process.exit(1);
+  }
+  console.error(`(자동 선택 타겟 접두사: ${found})`);
+  return found;
+}
+
+/** 실험 간 동일 zone 이름(문자열 일치) → 등장 실험 ID 목록 */
+function findDuplicateZones(results) {
+  /** @type {Map<string, number[]>} */
+  const byName = new Map();
+  for (const { experimentId, zones, error } of results) {
+    if (error) continue;
+    for (const name of zones) {
+      if (!byName.has(name)) byName.set(name, []);
+      byName.get(name).push(experimentId);
+    }
+  }
+  const dupes = [];
+  for (const [name, expIds] of byName) {
+    const unique = [...new Set(expIds)].sort((a, b) => a - b);
+    if (unique.length > 1) dupes.push({ zone: name, experimentIds: unique });
+  }
+  dupes.sort((a, b) => a.zone.localeCompare(b.zone));
+  return dupes;
+}
+
+function printBatchReport(results) {
+  const ok = results.filter((r) => !r.error);
+  const fail = results.filter((r) => r.error);
+
+  console.log("=== 실험별 zone 개수 ===");
+  let sumCounts = 0;
+  for (const r of results) {
+    if (r.error) {
+      console.log(`${r.experimentId}\t(실패: ${r.error})`);
+    } else {
+      const n = r.zones.length;
+      sumCounts += n;
+      const uniq = new Set(r.zones).size;
+      const intraDup = n > uniq ? `\t(동일 실험 내 중복 이름 ${n - uniq}건)` : "";
+      console.log(`${r.experimentId}\t${n}${intraDup}`);
+    }
+  }
+  console.log(`---`);
+  console.log(`실험 수(시도): ${results.length}`);
+  console.log(`성공 실험 수: ${ok.length}`);
+  console.log(`실패 실험 수: ${fail.length}`);
+  console.log(`zone 개수 합계(성공한 실험만, 행 단위 합): ${sumCounts}`);
+
+  const allNames = new Set();
+  for (const r of ok) for (const z of r.zones) allNames.add(z);
+  console.log(`고유 zone 이름 수(전체 실험 통합): ${allNames.size}`);
+
+  const dupes = findDuplicateZones(results);
+  console.log("");
+  console.log("=== 중복 zone (2개 이상 실험에 동일 이름) ===");
+  if (dupes.length === 0) {
+    console.log("(없음)");
+  } else {
+    for (const { zone, experimentIds } of dupes) {
+      console.log(`${zone}\t→ 실험 [${experimentIds.join(", ")}]`);
+    }
+    console.log(`--- 중복으로 잡힌 서로 다른 zone 이름 수: ${dupes.length}`);
+  }
+
+  console.log("");
+  console.log(JSON.stringify({ results, summary: { sumCounts, uniqueZoneNames: allNames.size, duplicateZoneEntries: dupes } }, null, 2));
+}
+
 function main() {
   const cdpRoot = resolveCdpRoot();
   if (!cdpRoot) {
@@ -118,66 +304,41 @@ function main() {
     process.exit(1);
   }
 
-  let experimentId;
-  let targetPrefix;
+  let parsed;
   try {
-    ({ experimentId, targetPrefix } = parseArgs(process.argv));
+    parsed = parseArgs(process.argv);
   } catch (e) {
     console.error(String(e.message || e));
     process.exit(1);
   }
 
-  if (!targetPrefix) {
-    let listOut;
+  const targetPrefix = resolveTargetPrefix(cdpRoot, parsed.targetPrefix);
+
+  if (parsed.mode === "single") {
+    const { experimentId } = parsed;
     try {
-      listOut = runCdp(cdpRoot, ["list"]);
+      const zones = fetchZonesForExperiment(cdpRoot, targetPrefix, experimentId);
+      console.log(JSON.stringify({ experimentId, zones }, null, 2));
     } catch (e) {
-      console.error("cdp list 실패:", e.message);
+      console.error(e.message || e);
       process.exit(1);
     }
-    targetPrefix = findPortalTargetPrefix(listOut);
-    if (!targetPrefix) {
-      console.error(
-        "logistics-dynamic-pricing 탭을 list에서 찾지 못했습니다. 포털 탭을 연 뒤 다시 시도하거나 --target 으로 타겟 접두사를 지정하세요.\n\n--- list ---\n" +
-          listOut
-      );
-      process.exit(1);
+    return;
+  }
+
+  /** @type {{ experimentId: number, zones?: string[], error?: string }[]} */
+  const batchResults = [];
+  for (const experimentId of parsed.batchIds) {
+    try {
+      const zones = fetchZonesForExperiment(cdpRoot, targetPrefix, String(experimentId));
+      batchResults.push({ experimentId, zones });
+    } catch (e) {
+      const msg = String(e.message || e);
+      console.error(`[실험 ${experimentId}] ${msg}`);
+      batchResults.push({ experimentId, error: msg });
     }
-    console.error(`(자동 선택 타겟 접두사: ${targetPrefix})`);
   }
-
-  const url = `https://portal.woowahan.com/pv2/kr/p/logistics-dynamic-pricing#/experiments/incentives/${experimentId}/edit`;
-
-  try {
-    runCdp(cdpRoot, ["nav", targetPrefix, url]);
-  } catch (e) {
-    console.error("cdp nav 실패:", e.message);
-    process.exit(1);
-  }
-
-  let evalOut;
-  try {
-    evalOut = runCdp(cdpRoot, ["eval", targetPrefix, EXTRACT_ZONES_JS]);
-  } catch (e) {
-    console.error("cdp eval 실패:", e.message);
-    process.exit(1);
-  }
-
-  const line = evalOut.trim().split("\n").pop() || evalOut.trim();
-  let data;
-  try {
-    data = JSON.parse(line);
-  } catch {
-    console.error("eval 결과 JSON 파싱 실패:\n", evalOut);
-    process.exit(1);
-  }
-
-  if (!data.ok) {
-    console.error(data.error || "unknown error");
-    process.exit(1);
-  }
-
-  console.log(JSON.stringify({ experimentId, zones: data.zones }, null, 2));
+  printBatchReport(batchResults);
 }
 
 main();
