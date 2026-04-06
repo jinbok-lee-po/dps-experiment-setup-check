@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "DPS 설정 검증",
-  "version": "1.0.1",
+  "version": "1.0.4",
   "description": "Woowa Portal DPS 실험의 Target Zones 목록을 검증합니다.",
   "content_scripts": [
     {
-      "matches": ["https://portal.woowahan.com/pv2/kr/p/logistics-dynamic-pricing*"],
+      "matches": ["https://portal.woowahan.com/*"],
       "js": ["content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"

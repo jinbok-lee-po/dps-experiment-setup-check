@@ -113,35 +113,53 @@ function findPortalTargetPrefix(listStdout) {
   return null;
 }
 
-/** iframe.pluginIframe 안 innerText에서 Zones 블록만 파싱 (이름만) */
-const EXTRACT_ZONES_JS = `(() => {
-  const f = document.querySelector("iframe.pluginIframe");
-  if (!f) return JSON.stringify({ ok: false, error: "no iframe.pluginIframe" });
-  let d;
-  try {
-    d = f.contentDocument;
-  } catch (e) {
-    return JSON.stringify({ ok: false, error: "cannot access iframe: " + e });
-  }
-  if (!d || !d.body) return JSON.stringify({ ok: false, error: "no iframe body" });
-  const t = d.body.innerText || "";
-  const marker = "Select Target Customers";
-  const zonesLabel = "\\nZones\\n";
-  let from = t.indexOf(marker);
-  if (from === -1) from = 0;
-  const slice = t.slice(from);
-  const z = slice.indexOf(zonesLabel);
-  if (z === -1) return JSON.stringify({ ok: false, error: "Zones section not found in iframe text" });
-  const after = slice.slice(z + zonesLabel.length);
-  const end = after.search(/\\nParent Verticals\\b/);
-  const block = end === -1 ? after : after.slice(0, end);
-  const lines = block
-    .split("\\n")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .filter((s) => s !== "Zones");
-  return JSON.stringify({ ok: true, zones: lines });
-})()`;
+/** iframe 이 목표 실험 edit URL 일 때만 파싱 (이전 실험 Zones 를 읽지 않도록) */
+function extractZonesJsForExperiment(expectedId) {
+  const exp = JSON.stringify(String(expectedId));
+  return `(() => {
+    const expected = ${exp};
+    const f = document.querySelector("iframe.pluginIframe");
+    if (!f) return JSON.stringify({ ok: false, error: "no iframe.pluginIframe" });
+    let href = "";
+    try {
+      href = (f.contentWindow && f.contentWindow.location && f.contentWindow.location.href) || "";
+    } catch (e) {
+      return JSON.stringify({ ok: false, error: "cannot read iframe location: " + e });
+    }
+    const m = href.match(/\\/incentives\\/(\\d+)\\/edit(?:[?#]|$)/);
+    const current = m ? m[1] : null;
+    if (current !== expected) {
+      return JSON.stringify({
+        ok: false,
+        error: "iframe route mismatch (current " + current + ", need " + expected + ")",
+      });
+    }
+    let d;
+    try {
+      d = f.contentDocument;
+    } catch (e) {
+      return JSON.stringify({ ok: false, error: "cannot access iframe: " + e });
+    }
+    if (!d || !d.body) return JSON.stringify({ ok: false, error: "no iframe body" });
+    const t = d.body.innerText || "";
+    const marker = "Select Target Customers";
+    const zonesLabel = "\\nZones\\n";
+    let from = t.indexOf(marker);
+    if (from === -1) from = 0;
+    const slice = t.slice(from);
+    const z = slice.indexOf(zonesLabel);
+    if (z === -1) return JSON.stringify({ ok: false, error: "Zones section not found in iframe text" });
+    const after = slice.slice(z + zonesLabel.length);
+    const end = after.search(/\\nParent Verticals\\b/);
+    const block = end === -1 ? after : after.slice(0, end);
+    const lines = block
+      .split("\\n")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .filter((s) => s !== "Zones");
+    return JSON.stringify({ ok: true, zones: lines });
+  })()`;
+}
 
 /**
  * 상위 창만 nav 하면 plugin iframe 의 해시가 안 바뀌어 목록 화면에 머무는 경우가 있다.
@@ -187,21 +205,23 @@ function sleepSync(ms) {
 }
 
 /**
- * iframe 라우트 반영·렌더 지연이 있으면 Zones 블록이 잠깐 비어 있다.
- * DPS_ZONES_POLL_MS (기본 500), DPS_ZONES_MAX_MS (기본 25000) 로 조절 가능.
+ * iframe 라우트가 목표 실험과 일치한 뒤에만 Zones 를 채택한다 (로딩 지연·스테일 UI 방지).
+ * DPS_ZONES_POLL_MS (기본 600), DPS_ZONES_MAX_MS (기본 45000), DPS_ZONES_NAV_SETTLE_MS (기본 400)
  */
 function fetchZonesForExperiment(cdpRoot, targetPrefix, experimentId) {
   const id = String(experimentId);
   const url = `https://portal.woowahan.com/pv2/kr/p/logistics-dynamic-pricing#/experiments/incentives/${id}/edit`;
   runCdp(cdpRoot, ["nav", targetPrefix, url]);
   parseIframeNavResult(runCdp(cdpRoot, ["eval", targetPrefix, navPluginIframeToEditJs(id)]));
-  const pollMs = Number(process.env.DPS_ZONES_POLL_MS) || 500;
-  const maxMs = Number(process.env.DPS_ZONES_MAX_MS) || 25000;
+  const settleMs = Number(process.env.DPS_ZONES_NAV_SETTLE_MS) || 400;
+  const pollMs = Number(process.env.DPS_ZONES_POLL_MS) || 600;
+  const maxMs = Number(process.env.DPS_ZONES_MAX_MS) || 45000;
+  sleepSync(settleMs);
   const deadline = Date.now() + maxMs;
-  let lastErr = "timeout waiting for Zones section";
+  let lastErr = "timeout waiting for target experiment + Zones section";
   while (Date.now() < deadline) {
     try {
-      const evalOut = runCdp(cdpRoot, ["eval", targetPrefix, EXTRACT_ZONES_JS]);
+      const evalOut = runCdp(cdpRoot, ["eval", targetPrefix, extractZonesJsForExperiment(id)]);
       return parseEvalZonesJson(evalOut);
     } catch (e) {
       lastErr = e.message || String(e);
